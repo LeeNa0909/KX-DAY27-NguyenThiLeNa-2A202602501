@@ -23,10 +23,33 @@ from common.schemas import (
     ESCALATE_THRESHOLD,
     PRAnalysis,
     ReviewState,
+    enforce_critical_security_escalation,
 )
 
 
 console = Console()
+
+
+def _escalation_questions(analysis: PRAnalysis) -> list[str]:
+    if analysis.escalation_questions:
+        return analysis.escalation_questions
+    context = " ".join(
+        [analysis.summary, *analysis.risk_factors, *(c.body for c in analysis.comments)]
+    ).lower()
+    questions = []
+    if "priorit" in context or "valid value" in context:
+        questions.append(
+            "Which priority values should the application accept, and how should it handle an invalid or missing value?"
+        )
+    if any(word in context for word in ("schema", "database", "migration", "existing data")):
+        questions.append(
+            "How should existing task records be migrated or defaulted so the priority change preserves their data?"
+        )
+    if not questions:
+        questions.append(
+            "What product or production constraint could change the recommendation for this change?"
+        )
+    return questions[:4]
 
 
 def node_fetch_pr(state):
@@ -41,14 +64,32 @@ def node_analyze(state):
     console.print("[cyan]→ analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
-        analysis = llm.invoke([
+        analysis = enforce_critical_security_escalation(llm.invoke([
             {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+                "You are a careful senior software reviewer. Return a concise summary, "
+                "concrete risk factors, and actionable comments in the requested schema. "
+                "Only cite files and lines supported by the diff. Assess confidence "
+                "from 0 to 1 as confidence that the review is complete, correct, and safe "
+                "to post without human confirmation. Use 0.58–0.72 for manageable "
+                "concerns such as missing tests, routine validation, or a small schema "
+                "addition whose risks can be described in the review; those concerns "
+                "alone do not justify confidence below 0.58. Reserve below 0.58 for "
+                "critical unresolved context that could change the recommendation, such "
+                "as unclear authentication, password hashing, credential storage, SQL "
+                "safety, or a migration that could irreversibly damage existing data. "
+                "When confidence is below 0.58, populate "
+                "escalation_questions with 2 to 4 "
+                "specific, context-rich questions for the reviewer. Reference files or "
+                "sections in the diff where possible, and ask about intent or constraints "
+                "that would change the review. Otherwise, leave escalation_questions empty. "
+                "Critical security patterns are mandatory escalation triggers: MD5 or another "
+                "fast unsalted password hash, plaintext credentials or tokens, SQL built with "
+                "user input, or hard-coded identity in authentication. If any appears in the "
+                "diff, confidence must be below 0.58 (usually 0.40-0.55) and you must include "
+                "2 to 4 reviewer questions. Do not treat these as routine validation or missing tests."
             )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
-        ])
+        ]))
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
     return {"analysis": analysis}
 
@@ -66,27 +107,50 @@ def node_route(state):
 def node_escalate(state: ReviewState) -> dict:
     """Ask the reviewer specific questions; return their answers in state."""
     a = state["analysis"]
-    questions = a.escalation_questions
-    if not questions:
-        # fallback when the LLM didn't generate any questions
-        questions = ["What is the intent of this PR?", "Any migration concerns?"]
+    questions = _escalation_questions(a)
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    original = state["analysis"]
+    answers = state.get("escalation_answers") or {}
+    qa = "\n\n".join(f"Question: {question}\nReviewer answer: {answer}" for question, answer in answers.items())
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer context...[/dim]"):
+        refined = enforce_critical_security_escalation(llm.invoke([
+            {
+                "role": "system",
+                "content": (
+                    "You are a careful senior software reviewer. Re-evaluate the pull "
+                    "request using the reviewer context. Keep findings tied to the diff, "
+                    "remove concerns resolved by the answers, and add any newly supported "
+                    "findings. Return a complete PRAnalysis, including a calibrated "
+                    "confidence score and any remaining escalation questions."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"PR title: {state['pr_title']}\n\n"
+                    f"Diff:\n{state['pr_diff']}\n\n"
+                    f"Initial analysis:\n{original.model_dump_json(indent=2)}\n\n"
+                    f"Reviewer Q&A:\n{qa}"
+                ),
+            },
+        ]))
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +225,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 

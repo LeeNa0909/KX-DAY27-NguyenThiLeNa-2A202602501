@@ -21,6 +21,7 @@ from common.schemas import (
     ESCALATE_THRESHOLD,
     PRAnalysis,
     ReviewState,
+    enforce_critical_security_escalation,
 )
 
 
@@ -40,22 +41,61 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    llm = get_llm().with_structured_output(PRAnalysis)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a careful senior software reviewer. Review the pull request "
+                "for correctness, security, maintainability, and missing tests. Return "
+                "a concise summary, concrete risk factors, and actionable comments. "
+                "Only cite files and lines supported by the diff; do not invent facts. "
+                "Report confidence from 0 to 1 as your confidence that the review is "
+                "complete, correct, and safe to post without human confirmation. Lower "
+                "confidence when the diff is ambiguous, incomplete, or requires important "
+                "product or security context. Use 0.58–0.72 for manageable concerns such "
+                "as missing tests, routine input validation, or a small schema addition "
+                "whose risks can be described in the review. Do not drop below 0.58 for "
+                "those concerns alone. Reserve confidence below 0.58 for critical unresolved "
+                "context that could change the recommendation, such as unclear authentication, "
+                "password hashing, credential storage, SQL safety, or a migration that could "
+                "irreversibly damage existing data. Ask specific reviewer questions for "
+                "those unresolved issues. Critical security patterns are mandatory escalation "
+                "triggers: MD5 or another fast unsalted password hash, plaintext credentials or "
+                "tokens, SQL built with user input, or hard-coded identity in authentication. "
+                "If any appears in the diff, confidence must be below 0.58 (usually 0.40-0.55) "
+                "and the review must include 2 to 4 reviewer questions. Do not treat these as "
+                "routine validation or missing-test concerns."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"PR title: {state['pr_title']}\n\nPR diff:\n{state['pr_diff']}",
+        },
+    ]
+    with console.status("[dim]LLM thinking...[/dim]"):
+        analysis = enforce_critical_security_escalation(llm.invoke(messages))
+    console.print(
+        f"  [green]✓[/green] confidence={analysis.confidence:.0%}, "
+        f"{len(analysis.comments)} comment(s)"
+    )
+    return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    confidence = state["analysis"].confidence
+    if confidence >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif confidence < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
+    console.print(
+        f"  [green]✓[/green] decision=[bold]{decision}[/bold] "
+        f"(confidence={confidence:.0%})"
+    )
+    return {"decision": decision}
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -75,11 +115,31 @@ def node_escalate(state: ReviewState) -> dict:
 
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+    for name, fn in [
+        ("fetch_pr", node_fetch_pr),
+        ("analyze", node_analyze),
+        ("route", node_route),
+        ("auto_approve", node_auto_approve),
+        ("human_approval", node_human_approval),
+        ("escalate", node_escalate),
+    ]:
+        g.add_node(name, fn)
+
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+    g.add_conditional_edges(
+        "route",
+        lambda state: state["decision"],
+        {
+            "auto_approve": "auto_approve",
+            "human_approval": "human_approval",
+            "escalate": "escalate",
+        },
+    )
+    g.add_edge("auto_approve", END)
+    g.add_edge("human_approval", END)
+    g.add_edge("escalate", END)
     return g.compile()
 
 

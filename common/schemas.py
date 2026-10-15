@@ -59,6 +59,44 @@ class PRAnalysis(BaseModel):
     )
 
 
+def enforce_critical_security_escalation(analysis: PRAnalysis) -> PRAnalysis:
+    """Cap confidence when the analysis identifies a critical security pattern.
+
+    Confidence represents whether a review is safe to post without human
+    context. Models can identify a serious finding yet still return a medium
+    score, so this policy guard keeps known blockers on the escalation path.
+    Routine validation and schema concerns are unaffected.
+    """
+    text = " ".join(
+        [analysis.summary, *analysis.risk_factors, *(comment.body for comment in analysis.comments)]
+    ).lower().replace("_", " ")
+
+    critical = []
+    if "md5" in text and any(word in text for word in ("password", "credential", "hash")):
+        critical.append("weak password hashing")
+    if any(word in text for word in ("plaintext", "plain text", "cleartext", "unencrypted")) and any(
+        word in text for word in ("token", "credential", "password", "secret")
+    ):
+        critical.append("plaintext credential or token storage")
+    if "sql injection" in text or "unsafe sql" in text:
+        critical.append("SQL injection risk")
+    if any(word in text for word in ("hard-coded", "hardcoded", "hard coded")) and any(
+        word in text for word in ("user id", "identity", "user identifier")
+    ):
+        critical.append("hard-coded authentication identity")
+
+    if not critical or analysis.confidence < ESCALATE_THRESHOLD:
+        return analysis
+
+    return analysis.model_copy(update={
+        "confidence": ESCALATE_THRESHOLD - 0.01,
+        "confidence_reasoning": (
+            f"{analysis.confidence_reasoning} Critical-security policy cap applied: "
+            f"{', '.join(critical)} requires reviewer context before this review is safe to post."
+        ),
+    })
+
+
 class AuditEntry(BaseModel):
     """One row of the PostgreSQL audit trail.
 

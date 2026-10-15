@@ -5,9 +5,9 @@ A 2-hour lab that builds a human-in-the-loop pull-request review agent in **Lang
 > 1. Agent reads a PR, analyzes code changes, proposes review comments.
 > 2. Confidence ~72% → show diff + reasoning → user approves → agent commits the review.
 > 3. Confidence ~58% → escalate: show context + specific questions for the reviewer.
-> 4. Every interaction is written to a SQLite audit trail; full sessions can be replayed.
+> 4. Every interaction is written to the configured audit backend (PostgreSQL or SQLite) and can be replayed.
 
-Students complete **4 exercises** (`exercises/`) that together build the full system. Each exercise has a runnable skeleton with `# TODO:` markers — your job is to fill them in.
+This repository contains the completed solution for the four exercises and the Streamlit app. The exercise sections below document the expected behavior and run commands.
 
 ## Background — what problem does this solve?
 
@@ -58,8 +58,8 @@ Every node also writes one row to `audit_events`. The graph state is persisted b
 - PostgreSQL audit trail
 
 **What this scaffolding already covers.** Exercises 1–4 deliver the HITL agent, confidence-based routing, and the structured audit trail. Two implementation notes:
-- The lab uses **SQLite** (`./hitl_audit.db`) instead of PostgreSQL for zero-setup. The schema is row-oriented with first-class columns — the same `AuditEntry` queries transfer to Postgres in production by swapping the checkpointer and connection string.
-- The approval UI is currently a terminal panel (Rich). The Streamlit UI is the fifth exercise — see [Exercise 5](#exercise-5--streamlit-approval-ui-apppy) below.
+- Set `AUDIT_DATABASE_URL` to store the structured `audit_events` audit trail in PostgreSQL. Leave it unset to use SQLite (`./hitl_audit.db`) with zero setup. LangGraph checkpoints remain in SQLite in both modes.
+- The Streamlit approval UI is implemented in `app.py` and uses the graph and audit APIs described below.
 
 ## Confidence routing
 
@@ -70,6 +70,8 @@ Every node also writes one row to `audit_events`. The graph state is persisted b
 | < 58%       | `escalate`       | Yes — answer specific questions    | PR-Demo #2 |
 
 Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.73`, `ESCALATE_THRESHOLD = 0.58`).
+
+Recognized critical security findings (such as MD5 password hashing, plaintext tokens, SQL injection, or hard-coded authentication identity) cap confidence below the escalation threshold. This guard prevents a medium LLM score from routing a known security blocker to routine approval.
 
 ## Layout
 
@@ -82,7 +84,7 @@ Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.73`, `ESCALA
 ├── common/                  # shared utilities — provided, don't modify
 │   ├── llm.py               # ChatOpenAI factory (OpenRouter)
 │   ├── github.py            # httpx REST API client: fetch_pr / post_review_comment
-│   ├── db.py                # aiosqlite connection + write_audit_event
+│   ├── db.py                # PostgreSQL / SQLite audit writer and replay queries
 │   └── schemas.py           # ReviewState (TypedDict) + PRAnalysis + AuditEntry (Pydantic)
 │
 ├── exercises/               # YOUR WORK — skeleton code with TODOs
@@ -103,7 +105,7 @@ Thresholds live in `common/schemas.py` (`AUTO_APPROVE_THRESHOLD = 0.73`, `ESCALA
 - An [OpenRouter](https://openrouter.ai/keys) API key (free tier has $1 credit)
 - A GitHub Personal Access Token — see next section
 
-No Docker, no Postgres install, no `gh` CLI. The agent talks to GitHub directly via the REST API. Audit + checkpointer state both live in a single SQLite file (`./hitl_audit.db`) created automatically on first run.
+SQLite works without extra services. To meet the PostgreSQL audit deliverable, configure `AUDIT_DATABASE_URL` with a PostgreSQL connection URL; the audit schema is created automatically on first use. The agent talks to GitHub directly via the REST API. LangGraph checkpoints remain in `./hitl_audit.db`.
 
 ## Get a GitHub Personal Access Token (PAT)
 
@@ -136,7 +138,28 @@ uv sync                                     # install Python deps
 cp .env.example .env && $EDITOR .env        # set OPENROUTER_API_KEY and GITHUB_TOKEN
 ```
 
-The SQLite file `hitl_audit.db` is created on demand when exercise 4 runs.
+The SQLite file `hitl_audit.db` is created on demand when exercise 4 runs. For PostgreSQL audit storage, set `AUDIT_DATABASE_URL` in `.env`; `uv sync` installs the async PostgreSQL driver.
+
+## PostgreSQL audit setup and verification
+
+The lab starts with SQLite so the review flow works without a database server. The assignment's PostgreSQL audit deliverable is supported by setting `AUDIT_DATABASE_URL` in `.env`. Use a local PostgreSQL server or a hosted PostgreSQL database, then run `uv sync`; the `audit_events` schema and indexes are created automatically on first use. Keep this URL private and out of Git.
+
+```dotenv
+AUDIT_DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
+```
+
+With the app or exercise 4 running, list recent audit sessions from the configured backend:
+
+```bash
+uv run python -m audit.replay --list
+uv run python -m audit.replay --thread <thread_id>
+```
+
+Run the deterministic flow and SQLite replay checks without calling the LLM or posting to GitHub:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
 
 ## Demo PRs
 
@@ -194,7 +217,7 @@ uv run python exercises/exercise_3_escalation.py --pr https://github.com/VinUni-
 # → terminal shows a yellow panel; type an answer for each question
 ```
 
-### Exercise 4 — Structured SQLite audit trail (`exercise_4_audit.py`)
+### Exercise 4 - Structured audit trail (PostgreSQL or SQLite)
 
 Use `AsyncSqliteSaver` so the graph can resume after a crash, **and** at every meaningful node event, write one structured row to `audit_events` using the `AuditEntry` Pydantic model defined in `common/schemas.py`:
 
@@ -233,7 +256,7 @@ uv run python -m audit.replay --list   # see recent threads
 | LangGraph **checkpointer** (SQLite)  | Resume graph after crash, time-travel | Binary blob        | LangGraph runtime |
 | Table **`audit_events`**             | Structured decision log               | First-class columns (queryable) | Auditors, humans  |
 
-Both live in the same `./hitl_audit.db` file. The assignment line "ghi vào audit trail" is fulfilled by `audit_events`. The checkpointer is a free bonus from using `AsyncSqliteSaver`.
+The SQLite audit table and checkpointer share `./hitl_audit.db` by default. When `AUDIT_DATABASE_URL` is set, structured audit rows go to PostgreSQL while graph checkpoints still use SQLite.
 
 ### Exercise 5 — Streamlit approval UI (`app.py`)
 
